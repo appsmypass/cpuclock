@@ -229,7 +229,7 @@ Two suites ship with the tool. Run them yourself.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File selftest.ps1    # 202 synthetic
-powershell -NoProfile -ExecutionPolicy Bypass -File realcheck.ps1   # 66 on real hardware
+powershell -NoProfile -ExecutionPolicy Bypass -File realcheck.ps1   # 70 on real hardware
 ```
 
 ### `selftest.ps1` — 202/202 passed
@@ -243,15 +243,17 @@ dpcPct 3.5  ·  interruptPct 7.25  ·  limitPct 88  ·  flags 0x21  ·  reported
 
 Also covered: every risk threshold tested on **both sides** of its boundary; UInt64 counters **above `Int64.MaxValue`** (where a `[long]` cast throws); counter resets becoming `null` and never `0`; mixed-case instance names from two different Windows APIs still pairing; `-Json` → `-FromJson` → `-FromJson` with no drift; **every error path exiting 2 while still emitting valid JSON**; a UTF-8 BOM tolerated; and a **cry-wolf test** requiring a healthy machine to report exactly zero problems.
 
-### `realcheck.ps1` — 66/66 passed on real hardware
+### `realcheck.ps1` — 70/70 passed on real hardware
 
 Synthetic fixtures are clean and predictable, which is exactly why they miss things. This suite runs against genuine live data:
 
 ```
   R1. WMI parse vs an independent PDH parse, field for field
         10 counter instances read from WMI
-        30 real fields compared across 10 instances, 0 mismatches
+        30 real fields compared across 10 instances over 6 alternating samples of each API, 0 mismatches
+        30 held still and had to agree EXACTLY between the two APIs
         WMI spells them _Total, 0,_Total; PDH spells them 0,_total, _total
+        30 of 30 deliberately corrupted values rejected (inverted flag, wrong field offset, percent read as fraction)
 
   R2. The tool arithmetic vs PDH cooked values over the same window
         30 live counters recomputed; worst relative error 0.000000%
@@ -263,24 +265,25 @@ Synthetic fixtures are clean and predictable, which is exactly why they miss thi
         8 per-core instances for 8 logical processors on Intel(R) Core(TM) i7-1065G7 CPU @ 1.30GHz
         active power plan: Ultimate Performance (e005d524-f1ff-479e-98be-0ee8a61237d4)
         PROCTHROTTLEMAX AC = 100%, DC = 100%
-        Win32_Battery.BatteryStatus = 2 (on battery: False)
-        nominal derived from counters 1,498.4 MHz vs WMI MaxClockSpeed 1498 MHz (0.029% apart)
+        Win32_Battery.BatteryStatus = 1 (on battery: True)
+        nominal derived from counters 1,498.1 MHz vs WMI MaxClockSpeed 1498 MHz (0.008% apart)
 
   R5. Headline claim proven by generating the condition
-        idle 2,664 MHz / 177.8%   ->   under load 3,493 MHz / 233.2%
-        measured 3,493 MHz against a reported "maximum" of 1498 MHz - 2.33x over
-        Win32_Processor.CurrentClockSpeed said 1298 MHz at the same moment - out by 2.69x
-        platform guarantee 85% while delivering 233% - correctly reported as opportunistic turbo
+        this machine was cool: sustained load clocked HIGHER than idle
+        idle 2,616 MHz / 174.6%   ->   under load 2,908 MHz / 194.1%
+        measured 2,908 MHz against a reported "maximum" of 1498 MHz - 1.94x over
+        Win32_Processor.CurrentClockSpeed said 1298 MHz throughout - out by 2.24x
+        platform guarantee 85% while delivering 194% - correctly reported as opportunistic turbo
 
   R6. The tool own -Json output, bounds and aggregate sanity
         10 rows bounds-checked in the tool own JSON
-        _total utility 78.8% vs mean of cores 78.8% (their sum would be 630.2%)
-        _total 3,426 MHz, cores span 3,313-3,571 MHz
+        _total utility 5.3% vs mean of cores 5.3% (their sum would be 42.8%)
+        _total 1,375 MHz, cores span 1,252-2,579 MHz
 
   R7. Read-only, proved by snapshot
         power plan, processor state settings and execution policy all unchanged
 
-  passed 66 / 66
+  passed 70 / 70
   ALL REAL-HARDWARE CHECKS PASSED
 ```
 
@@ -288,9 +291,24 @@ A few of those deserve unpacking:
 
 **R2 — `worst relative error 0.000000%`.** The formulas in this tool were not guessed from documentation. PDH exposes its raw counter values alongside its cooked ones, so the tool's own arithmetic was run over two consecutive PDH raw samples — covering the *identical* window PDH used — and compared against PDH's answer. Across 30 live counters the two agree to the digit.
 
-**R5 — the headline claim, proven by generating the condition.** A number that does not throw an error is not the same as a number that is right; a stale value or a plausible constant is exactly what a broken code path returns. So the suite *creates* the condition: it spawns two CPU-bound workers, waits for them to signal `READY` (a JIT-compiling generator needs a readiness signal, not a fixed head start), and requires the measured clock to actually move. It went **2,664 → 3,493 MHz**, while `CurrentClockSpeed` sat frozen at 1298.
+**R1 — comparing two APIs that cannot be sampled at the same instant.** WMI and PDH are different DLLs with different query languages, so the tool's parse is verified field-for-field against a completely independent one. But every field here is *instantaneous*, and one of them — `Parking Status` — is a binary flag that flips **many times per second**. Demanding the two APIs agree on it compares two different moments, not two parses; it reported a mismatch against a perfectly correct tool. Bracketing the PDH read between two WMI reads did not help either, because the core parked and unparked entirely inside the gap.
 
-**R6 — the aggregate check.** Every individual reading can be within bounds while an aggregate is nonsense. Cores run in **parallel**, so summing their percentages is how a tool ends up claiming 800% CPU. The suite asserts the roll-up is the *mean* of the per-core rows (78.8% — where their sum would be **630.2%**) and that the roll-up clock sits inside the per-core range.
+So the suite **classifies each field before judging it**. Fields that held still across six alternating samples of each API must agree *exactly* — that is the decisive claim, and on a quiet machine all 30 qualify. Fields caught mid-change are reported as undecidable and only checked against their legal domain, because claiming "0 mismatches" about data that cannot be compared would be a lie. Runs where cores 2–7 were parking show `24–28 held still` and name the rest.
+
+**The negative control.** A comparison that tolerates anything proves nothing, so the same check is replayed against deliberately corrupted values — an inverted parking flag, a frequency read from the wrong field offset, a percentage read as a fraction — and **every one must be rejected**. `30 of 30 rejected` is what makes the `0 mismatches` above mean something.
+
+**R5 — the headline claim, proven by generating the condition.** A number that does not throw an error is not the same as a number that is right; a stale value or a plausible constant is exactly what a broken code path returns. So the suite *creates* the condition: it spawns two CPU-bound workers, waits for them to signal `READY` (a JIT-compiling generator needs a readiness signal, not a fixed head start), and requires the measured clock to actually move.
+
+The direction it moves is **not** fixed, and assuming it was produced a failing test against a correct tool. Actual Frequency is the average clock while the CPU is *executing*, not weighted by how much work it did. An idle laptop races to idle — the few instructions that run are dispatched at full turbo — so idle can read *higher* than sustained load once the chip hits its thermal budget. Both were observed on this machine:
+
+| machine state | idle | under sustained load |
+|---|---|---|
+| cool | 2,616 MHz | **2,908 MHz** |
+| already hot | 3,757 MHz | 3,580 MHz |
+
+Both are correct measurements, so the suite asserts what is actually invariant: utility rose sharply, the reading is not a constant, `% Processor Performance` and `Actual Frequency` always agree on direction, and — whichever way it went — the delivered clock **beat the maximum Windows advertises**, by 1.94× here and 2.51× when hot.
+
+**R6 — the aggregate check.** Every individual reading can be within bounds while an aggregate is nonsense. Cores run in **parallel**, so summing their percentages is how a tool ends up claiming 800% CPU. The suite asserts the roll-up is the *mean* of the per-core rows (5.3% — where their sum would be **42.8%**) and that the roll-up clock sits inside the per-core range.
 
 **R3 — ground truth planted inside real data.** Three synthetic rows with known values are appended to a genuine snapshot of the live machine. The tool must find every planted value exactly, and no real value may leak into them or vice versa. It proves the parser works while surrounded by real, irrelevant data — which is how it will actually be used.
 
