@@ -1,0 +1,20 @@
+# cpuclock reports
+*.json
+!package.json
+
+# Test and capture scratch
+_out/
+_*.ps1
+*.err
+*.log
+
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Editors
+.vs/
+.vscode/
+*.swp
+*~
